@@ -11,15 +11,26 @@ self.onmessage = (e) => {
     }
 };
 
-const DELAY_MS = 50;
+const DELAY_MS = 15; // Tăng tốc độ visualize
+const STAGNATION_TIME_MS = 5000; // 5 giây
+
+// --- Dynamic Threshold Logic ---
+// Trả về số lượng conflict tối thiểu cần giảm được để reset bộ đếm stagnation
+function getDynamicThreshold(currentConflicts) {
+    if (currentConflicts > 100) return 5; // Đang sai quá nhiều -> Yêu cầu giảm mạnh mới tính là tiến bộ
+    if (currentConflicts > 80) return 4;
+    if (currentConflicts > 50) return 3;
+    if (currentConflicts > 20) return 2;
+    return 1; // Giai đoạn cuối -> Yêu cầu giảm từng chút một là ok
+}
 
 async function runAlgorithm({ name, graphData, params }) {
     console.log(`Starting ${name} with ${graphData.nodes.length} nodes`);
 
-    // --- Data Structure Optimization ---
+    // --- Setup Graph Data ---
     const nodeCount = graphData.nodes.length;
-    const nodeMap = new Map(); // ID -> Index
-    const revNodeMap = new Array(nodeCount); // Index -> ID
+    const nodeMap = new Map();
+    const revNodeMap = new Array(nodeCount);
 
     graphData.nodes.forEach((n, i) => {
         nodeMap.set(n.id, i);
@@ -43,98 +54,103 @@ async function runAlgorithm({ name, graphData, params }) {
         adj,
         coloring,
         revNodeMap,
-        params: { ...params }, // Copy params
+        params: { ...params },
         startTime: performance.now(),
         stepCount: 0,
         links: graphData.links,
         globalStartTime: performance.now(),
-        timeLimit: (params.timeLimit || 10) * 1000, // ms
+        timeLimit: (params.timeLimit || 10) * 1000,
     };
 
-    // Dynamic Runner Logic
-    let currentMaxColors = 5;
+    // --- Logic Start Colors ---
+    // Greedy/Exact thì kệ nó (Infinity hoặc 4), còn Meta-heuristic thì bắt đầu từ 3
+    let currentMaxColors = ['basicGreedy', 'welshPowell', 'dSatur', 'rlf', 'ilp'].includes(name) ? Infinity : 3;
     let solved = false;
 
     try {
-        // Greedy algorithms don't need the loop, they just run once
-        if (['basicGreedy', 'welshPowell', 'dSatur', 'rlf'].includes(name)) {
-            context.params.maxColors = Infinity; // Let them use as many as needed
+        // Nhóm Greedy chạy 1 lần là xong
+        if (context.params.maxColors === Infinity) {
             await runSpecificAlgorithm(name, context);
-
-            // Calculate used colors
-            let maxC = 0;
-            for (let i = 0; i < nodeCount; i++) if (coloring[i] > maxC) maxC = coloring[i];
-
-            self.postMessage({
-                type: 'DONE',
-                payload: {
-                    result: 'Completed',
-                    metrics: {
-                        time: performance.now() - context.globalStartTime,
-                        colors: maxC
-                    }
-                }
-            });
+            finish(context, 'Completed');
             return;
         }
 
-        // Iterative/Meta-heuristics Loop
+        // Nhóm Loop (Meta-heuristics)
         while (!solved) {
             if (performance.now() - context.globalStartTime > context.timeLimit) {
-                break; // Time limit reached
+                finish(context, 'Limit Reached');
+                return;
             }
 
             context.params.maxColors = currentMaxColors;
-            coloring.fill(0); // Reset for new attempt
 
-            // For meta-heuristics, we need them to respect the global time limit
-            // We can pass a "soft limit" or just let them run and check periodically?
-            // Existing algos use checkLimit() which checks stepCount.
-            // We should update checkLimit to check time too.
+            // Reset màu cho Backtracking (Meta-heuristic tự init bên trong)
+            if (name === 'backtracking' || name === 'branchAndBound') {
+                coloring.fill(0);
+            }
 
+            // Chạy thuật toán (sẽ tự thoát nếu dính Dynamic Stagnation)
             await runSpecificAlgorithm(name, context);
 
             const { count } = countConflicts(coloring, adj);
+
             if (count === 0) {
                 solved = true;
                 break;
             }
 
-            // If not solved, increase colors
+            // Tăng màu
             currentMaxColors++;
-            // Notify UI of color increase
+
             self.postMessage({
                 type: 'STEP',
                 payload: {
                     step: 0,
-                    coloring: {}, // Empty update just for log/status?
                     conflicts: [],
-                    metrics: { iter: 0, conflicts: count, time: performance.now() - context.globalStartTime, status: `Increasing Colors to ${currentMaxColors}` }
+                    metrics: {
+                        iter: 0,
+                        conflicts: count,
+                        time: performance.now() - context.globalStartTime,
+                        status: `Dynamic Stagnation. Boosting Colors to ${currentMaxColors}...`
+                    }
                 }
             });
-            await delay(100);
+            await delay(50);
         }
 
-        self.postMessage({
-            type: 'DONE',
-            payload: {
-                result: solved ? 'Completed' : 'Limit Reached',
-                metrics: {
-                    time: performance.now() - context.globalStartTime,
-                    colors: currentMaxColors
-                }
-            }
-        });
+        finish(context, solved ? 'Completed' : 'Limit Reached');
 
     } catch (error) {
-        if (error.message === 'LIMIT_REACHED') {
-            // Should not happen with time limit check, but just in case
-            self.postMessage({ type: 'DONE', payload: { result: 'Limit Reached' } });
-        } else {
-            console.error(error);
-            self.postMessage({ type: 'ERROR', payload: { message: error.message } });
+        console.error(error);
+        self.postMessage({ type: 'ERROR', payload: { message: error.message } });
+    }
+}
+
+function finish(ctx, result) {
+    let maxC = 0;
+    for (let i = 0; i < ctx.nodeCount; i++) if (ctx.coloring[i] > maxC) maxC = ctx.coloring[i];
+
+    self.postMessage({
+        type: 'DONE',
+        payload: {
+            result: result,
+            metrics: {
+                time: performance.now() - ctx.globalStartTime,
+                colors: maxC
+            },
+            coloring: mapColoring(ctx),
+        }
+    });
+}
+
+function mapColoring(ctx) {
+    const coloringMap = {};
+    for (let i = 0; i < ctx.nodeCount; i++) {
+        if (ctx.coloring[i] !== 0) {
+            coloringMap[ctx.revNodeMap[i]] = ctx.coloring[i];
         }
     }
+    return coloringMap;
 }
 
 async function runSpecificAlgorithm(name, ctx) {
@@ -145,7 +161,7 @@ async function runSpecificAlgorithm(name, ctx) {
         case 'rlf': await runRLF(ctx); break;
         case 'backtracking': await runBranchAndBoundIterative(ctx); break;
         case 'branchAndBound': await runBranchAndBoundIterative(ctx); break;
-        case 'ilp': await runBasicGreedy(ctx); break; // Placeholder
+        case 'ilp': await runBasicGreedy(ctx); break;
         case 'simulatedAnnealing': await runSimulatedAnnealing(ctx); break;
         case 'geneticAlgorithm': await runGeneticAlgorithm(ctx); break;
         case 'tabuSearch': await runTabuSearch(ctx); break;
@@ -153,26 +169,20 @@ async function runSpecificAlgorithm(name, ctx) {
     }
 }
 
-// --- Helpers ---
-
-function checkLimit(ctx) {
-    ctx.stepCount++;
-    // Check Time Limit
-    if (performance.now() - ctx.globalStartTime > ctx.timeLimit) {
-        throw new Error('LIMIT_REACHED');
-    }
+// --- Common Helpers ---
+function checkGlobalTime(ctx) {
+    return (performance.now() - ctx.globalStartTime > ctx.timeLimit);
 }
 
-// Optimized conflict counter for Int32Array
 function countConflicts(coloring, adj) {
     let count = 0;
-    const conflicts = []; // Store pairs of indices
+    const conflicts = [];
     for (let u = 0; u < coloring.length; u++) {
-        if (coloring[u] === 0) continue; // Skip uncolored
+        if (coloring[u] === 0) continue;
         const neighbors = adj[u];
         for (let i = 0; i < neighbors.length; i++) {
             const v = neighbors[i];
-            if (u < v && coloring[v] === coloring[u]) { // u < v to avoid duplicates
+            if (u < v && coloring[v] === coloring[u]) {
                 count++;
                 conflicts.push([u, v]);
             }
@@ -184,30 +194,25 @@ function countConflicts(coloring, adj) {
 function getLeastConflictingColor(u, adj, coloring, maxColors) {
     let bestColor = 1;
     let minConflicts = Infinity;
-
     for (let c = 1; c <= maxColors; c++) {
         let conflicts = 0;
         for (let i = 0; i < adj[u].length; i++) {
-            const v = adj[u][i];
-            if (coloring[v] === c) conflicts++;
+            if (coloring[adj[u][i]] === c) conflicts++;
         }
-
         if (conflicts < minConflicts) {
             minConflicts = conflicts;
             bestColor = c;
-            if (minConflicts === 0) break; // Optimization
+            if (minConflicts === 0) break;
         }
     }
     return bestColor;
 }
 
-// Reconstruct object for UI (Expensive, so use sparingly)
 function sendStep(ctx, step, overrideColoring = null, status = null) {
     const activeColoring = overrideColoring || ctx.coloring;
     const { count, conflicts } = countConflicts(activeColoring, ctx.adj);
     const elapsedTime = performance.now() - ctx.globalStartTime;
 
-    // Convert array coloring to object map for UI
     const coloringMap = {};
     for (let i = 0; i < ctx.nodeCount; i++) {
         if (activeColoring[i] !== 0) {
@@ -215,7 +220,6 @@ function sendStep(ctx, step, overrideColoring = null, status = null) {
         }
     }
 
-    // Convert conflict indices to ID objects/strings
     const conflictEdges = conflicts.map(([u, v]) => ({
         source: ctx.revNodeMap[u],
         target: ctx.revNodeMap[v]
@@ -236,296 +240,155 @@ function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// --- Greedy Algorithms (Optimized) ---
-
+// --- Greedy & Exact (Giữ nguyên logic cũ) ---
 async function runBasicGreedy(ctx) {
     const { nodeCount, adj, coloring, params } = ctx;
     const maxColors = params.maxColors || Infinity;
-
     for (let u = 0; u < nodeCount; u++) {
-        checkLimit(ctx);
         const usedColors = new Set();
         const neighbors = adj[u];
-        for (let i = 0; i < neighbors.length; i++) {
-            const v = neighbors[i];
-            if (coloring[v] !== 0) usedColors.add(coloring[v]);
-        }
-
+        for (let i = 0; i < neighbors.length; i++) { if (coloring[neighbors[i]] !== 0) usedColors.add(coloring[neighbors[i]]); }
         let color = 1;
         while (usedColors.has(color)) color++;
-
-        if (color <= maxColors) {
-            coloring[u] = color;
-        } else {
-            coloring[u] = getLeastConflictingColor(u, adj, coloring, maxColors);
-        }
+        coloring[u] = (color <= maxColors) ? color : getLeastConflictingColor(u, adj, coloring, maxColors);
         sendStep(ctx, u);
         await delay(DELAY_MS);
     }
 }
-
 async function runWelshPowell(ctx) {
     const { nodeCount, adj, coloring, params } = ctx;
     const maxColors = params.maxColors || Infinity;
-
-    // Sort nodes by degree descending
     const degrees = adj.map((neighbors, i) => ({ index: i, degree: neighbors.length }));
     degrees.sort((a, b) => b.degree - a.degree);
     const sortedIndices = degrees.map(d => d.index);
-
     for (let i = 0; i < nodeCount; i++) {
-        checkLimit(ctx);
         const u = sortedIndices[i];
         const usedColors = new Set();
         const neighbors = adj[u];
-        for (let j = 0; j < neighbors.length; j++) {
-            const v = neighbors[j];
-            if (coloring[v] !== 0) usedColors.add(coloring[v]);
-        }
-
+        for (let j = 0; j < neighbors.length; j++) { if (coloring[neighbors[j]] !== 0) usedColors.add(coloring[neighbors[j]]); }
         let color = 1;
         while (usedColors.has(color)) color++;
-
-        if (color <= maxColors) {
-            coloring[u] = color;
-        } else {
-            coloring[u] = getLeastConflictingColor(u, adj, coloring, maxColors);
-        }
+        coloring[u] = (color <= maxColors) ? color : getLeastConflictingColor(u, adj, coloring, maxColors);
         sendStep(ctx, i);
         await delay(DELAY_MS);
     }
 }
-
 async function runDSatur(ctx) {
     const { nodeCount, adj, coloring, params } = ctx;
     const maxColors = params.maxColors || Infinity;
-    const degrees = adj.map(n => n.length);
     const uncolored = new Set(Array.from({ length: nodeCount }, (_, i) => i));
-
     let step = 0;
     while (uncolored.size > 0) {
-        checkLimit(ctx);
-        let bestNode = -1;
-        let maxSat = -1;
-        let maxDeg = -1;
-
-        // Find node with max saturation
+        let bestNode = -1, maxSat = -1, maxDeg = -1;
         for (const u of uncolored) {
             const neighborColors = new Set();
             const neighbors = adj[u];
-            for (let i = 0; i < neighbors.length; i++) {
-                const v = neighbors[i];
-                if (coloring[v] !== 0) neighborColors.add(coloring[v]);
-            }
+            for (let i = 0; i < neighbors.length; i++) if (coloring[neighbors[i]] !== 0) neighborColors.add(coloring[neighbors[i]]);
             const sat = neighborColors.size;
-
-            if (sat > maxSat || (sat === maxSat && degrees[u] > maxDeg)) {
-                maxSat = sat;
-                maxDeg = degrees[u];
-                bestNode = u;
-            }
+            if (sat > maxSat || (sat === maxSat && degrees[u] > maxDeg)) { maxSat = sat; maxDeg = degrees[u]; bestNode = u; }
         }
-
         const usedColors = new Set();
         const neighbors = adj[bestNode];
-        for (let i = 0; i < neighbors.length; i++) {
-            const v = neighbors[i];
-            if (coloring[v] !== 0) usedColors.add(coloring[v]);
-        }
-
+        for (let i = 0; i < neighbors.length; i++) if (coloring[neighbors[i]] !== 0) usedColors.add(coloring[neighbors[i]]);
         let color = 1;
         while (usedColors.has(color)) color++;
-
-        if (color <= maxColors) {
-            coloring[bestNode] = color;
-        } else {
-            coloring[bestNode] = getLeastConflictingColor(bestNode, adj, coloring, maxColors);
-        }
+        coloring[bestNode] = (color <= maxColors) ? color : getLeastConflictingColor(bestNode, adj, coloring, maxColors);
         uncolored.delete(bestNode);
         sendStep(ctx, step++);
         await delay(DELAY_MS);
     }
 }
-
 async function runRLF(ctx) {
     const { nodeCount, adj, coloring, params } = ctx;
     const maxColors = params.maxColors || Infinity;
     const uncolored = new Set(Array.from({ length: nodeCount }, (_, i) => i));
     let color = 1;
     let step = 0;
-
     while (uncolored.size > 0) {
-        checkLimit(ctx);
         if (color > maxColors) {
-            // Force assign remaining
             const remaining = Array.from(uncolored);
-            for (const u of remaining) {
-                coloring[u] = getLeastConflictingColor(u, adj, coloring, maxColors);
-                sendStep(ctx, step++);
-                await delay(DELAY_MS);
-            }
+            for (const u of remaining) { coloring[u] = getLeastConflictingColor(u, adj, coloring, maxColors); sendStep(ctx, step++); await delay(DELAY_MS); }
             uncolored.clear();
             break;
         }
-
-        // Find node with max degree in uncolored subgraph
-        let bestNode = -1;
-        let maxDeg = -1;
+        let bestNode = -1, maxDeg = -1;
         for (const u of uncolored) {
             let deg = 0;
             const neighbors = adj[u];
-            for (let i = 0; i < neighbors.length; i++) {
-                if (uncolored.has(neighbors[i])) deg++;
-            }
-            if (deg > maxDeg) {
-                maxDeg = deg;
-                bestNode = u;
-            }
+            for (let i = 0; i < neighbors.length; i++) if (uncolored.has(neighbors[i])) deg++;
+            if (deg > maxDeg) { maxDeg = deg; bestNode = u; }
         }
-
         if (bestNode === -1) break;
-
         const colorClass = new Set([bestNode]);
         coloring[bestNode] = color;
         uncolored.delete(bestNode);
         sendStep(ctx, step++);
         await delay(DELAY_MS);
-
-        // Add non-adjacent nodes to color class
         while (true) {
-            checkLimit(ctx);
-            let candidate = -1;
-            let maxCommon = -1;
-
+            let candidate = -1, maxCommon = -1;
             for (const u of uncolored) {
-                // Check if adjacent to any node in colorClass
                 let isAdjacent = false;
                 const neighbors = adj[u];
-                for (let i = 0; i < neighbors.length; i++) {
-                    if (colorClass.has(neighbors[i])) {
-                        isAdjacent = true;
-                        break;
-                    }
-                }
-
+                for (let i = 0; i < neighbors.length; i++) if (colorClass.has(neighbors[i])) { isAdjacent = true; break; }
                 if (!isAdjacent) {
-                    // Count common neighbors with uncolored set
                     let common = 0;
-                    for (let i = 0; i < neighbors.length; i++) {
-                        if (uncolored.has(neighbors[i])) common++;
-                    }
-                    if (common > maxCommon) {
-                        maxCommon = common;
-                        candidate = u;
-                    }
+                    for (let i = 0; i < neighbors.length; i++) if (uncolored.has(neighbors[i])) common++;
+                    if (common > maxCommon) { maxCommon = common; candidate = u; }
                 }
             }
-
-            if (candidate !== -1) {
-                colorClass.add(candidate);
-                coloring[candidate] = color;
-                uncolored.delete(candidate);
-                sendStep(ctx, step++);
-                await delay(DELAY_MS);
-            } else {
-                break;
-            }
+            if (candidate !== -1) { colorClass.add(candidate); coloring[candidate] = color; uncolored.delete(candidate); sendStep(ctx, step++); await delay(DELAY_MS); }
+            else break;
         }
         color++;
     }
 }
-
-// --- Exact Algorithms (Iterative) ---
-
 async function runBranchAndBoundIterative(ctx) {
     const { nodeCount, adj, coloring, params } = ctx;
     const maxColors = params.maxColors || 4;
-
-    // Best solution tracking
-    let bestColoring = new Int32Array(nodeCount); // Starts empty
+    let bestColoring = new Int32Array(nodeCount);
     let minConflicts = Infinity;
-
-    // Stack for iterative backtracking: { index, color, conflicts }
     const stack = [{ index: 0, color: 1, conflicts: 0 }];
     let step = 0;
-
-    // Reset coloring
+    const degrees = adj.map((neighbors, i) => ({ index: i, degree: neighbors.length }));
+    degrees.sort((a, b) => b.degree - a.degree);
+    const sortedIndices = degrees.map(d => d.index);
     coloring.fill(0);
-
-    try {
-        while (stack.length > 0) {
-            checkLimit(ctx);
-            const current = stack[stack.length - 1]; // Peek
-            const { index, color, conflicts } = current;
-
-            // If we tried all colors for this node, backtrack
-            if (color > maxColors) {
-                coloring[index] = 0; // Reset
-                stack.pop();
-                if (stack.length > 0) {
-                    stack[stack.length - 1].color++; // Try next color for previous node
-                }
-                continue;
-            }
-
-            // Calculate conflicts added by assigning `color` to `index`
-            // Only check neighbors < index (already colored)
-            let addedConflicts = 0;
-            const neighbors = adj[index];
-            for (let i = 0; i < neighbors.length; i++) {
-                const v = neighbors[i];
-                if (v < index && coloring[v] === color) {
-                    addedConflicts++;
-                }
-            }
-
-            const newConflicts = conflicts + addedConflicts;
-
-            // Pruning: If newConflicts >= minConflicts, this branch cannot beat the best found
-            if (newConflicts >= minConflicts) {
-                current.color++;
-                continue;
-            }
-
-            // Valid assignment (within bound)
-            coloring[index] = color;
-
-            // Visualization (throttled)
-            if (step % 100 === 0) {
-                sendStep(ctx, step);
-                await delay(0);
-            }
-            step++;
-
-            if (index === nodeCount - 1) {
-                // Leaf reached (Complete Coloring)
-                if (newConflicts < minConflicts) {
-                    minConflicts = newConflicts;
-                    bestColoring.set(coloring);
-                    sendStep(ctx, step, bestColoring); // Show new best immediately
-                    await delay(10);
-
-                    if (minConflicts === 0) {
-                        return; // Found optimal solution, stop.
-                    }
-                }
-                // Backtrack to find others? 
-                current.color++;
-            } else {
-                // Push next node
-                stack.push({ index: index + 1, color: 1, conflicts: newConflicts });
-            }
+    while (stack.length > 0) {
+        if (checkGlobalTime(ctx)) return;
+        const current = stack[stack.length - 1];
+        const { index, color, conflicts } = current;
+        const u = sortedIndices[index];
+        if (color > maxColors) {
+            coloring[u] = 0;
+            stack.pop();
+            if (stack.length > 0) stack[stack.length - 1].color++;
+            continue;
         }
-    } finally {
-        // Ensure we always return the best solution found, even if limit reached or error
-        if (minConflicts !== Infinity) {
-            coloring.set(bestColoring);
-        }
-        sendStep(ctx, step);
+        let addedConflicts = 0;
+        const neighbors = adj[u];
+        for (let i = 0; i < neighbors.length; i++) { const v = neighbors[i]; if (coloring[v] === color) addedConflicts++; }
+        const newConflicts = conflicts + addedConflicts;
+        if (newConflicts >= minConflicts) { current.color++; continue; }
+        coloring[u] = color;
+        if (step % 200 === 0) { sendStep(ctx, step); await delay(0); }
+        step++;
+        if (index === nodeCount - 1) {
+            const { count } = countConflicts(coloring, adj);
+            if (count < minConflicts) {
+                minConflicts = count;
+                bestColoring.set(coloring);
+                sendStep(ctx, step, bestColoring);
+                await delay(10);
+                if (minConflicts === 0) return;
+            }
+            current.color++;
+        } else { stack.push({ index: index + 1, color: 1, conflicts: newConflicts }); }
     }
+    if (minConflicts !== Infinity) coloring.set(bestColoring);
+    sendStep(ctx, step);
 }
 
-// --- Meta-heuristics (Optimized) ---
+// --- Meta-heuristics (UPDATED with DYNAMIC THRESHOLD) ---
 
 function randomColoringArray(nodeCount, maxColors) {
     const c = new Int32Array(nodeCount);
@@ -537,38 +400,54 @@ function randomColoringArray(nodeCount, maxColors) {
 
 async function runSimulatedAnnealing(ctx) {
     const { nodeCount, adj, coloring, params } = ctx;
-    const maxColors = params.maxColors || 5;
+    const maxColors = params.maxColors;
 
-    // Initial random coloring
+    // Init & Send visual immediately
     const initial = randomColoringArray(nodeCount, maxColors);
     coloring.set(initial);
+    sendStep(ctx, 0, coloring, 'Initializing SA...');
+    await delay(50);
 
     let currentConflicts = countConflicts(coloring, adj).count;
     let bestColoring = new Int32Array(coloring);
     let minConflicts = currentConflicts;
 
+    // Checkpoint để tính Dynamic Stagnation
+    let bestConflictsAtLastCheck = minConflicts;
+
     let T = params.temperature || 1000;
-    const initialT = T;
+    const coolingRate = 0.9995;
     const minT = 0.001;
-    // Use a fixed maxSteps for cooling schedule, but loop respects global time
-    const maxSteps = 5000;
-    const coolingRate = Math.pow(minT / initialT, 1 / maxSteps);
 
     let step = 0;
+    let lastCheckTime = performance.now();
 
-    while (T > minT && currentConflicts > 0) {
-        checkLimit(ctx);
+    while (currentConflicts > 0 && T > minT) {
+        if (checkGlobalTime(ctx)) return;
 
-        // Pick random node
+        // --- DYNAMIC STAGNATION CHECK ---
+        if (performance.now() - lastCheckTime > STAGNATION_TIME_MS) {
+            const threshold = getDynamicThreshold(bestConflictsAtLastCheck);
+            const improvement = bestConflictsAtLastCheck - minConflicts;
+
+            if (improvement < threshold) {
+                // Không đạt chỉ tiêu -> Thoát để tăng màu
+                sendStep(ctx, step, bestColoring, `SA Stagnated (Imp: ${improvement} < Thres: ${threshold}). Retry...`);
+                return;
+            } else {
+                // Đạt chỉ tiêu -> Reset mốc check
+                bestConflictsAtLastCheck = minConflicts;
+                lastCheckTime = performance.now();
+            }
+        }
+
+        // Logic SA
         const u = Math.floor(Math.random() * nodeCount);
         const oldColor = coloring[u];
         const newColor = Math.floor(Math.random() * maxColors) + 1;
-
         if (oldColor === newColor) continue;
 
-        // Incremental Delta Calculation (O(degree))
-        let oldNodeConflicts = 0;
-        let newNodeConflicts = 0;
+        let oldNodeConflicts = 0, newNodeConflicts = 0;
         const neighbors = adj[u];
         for (let i = 0; i < neighbors.length; i++) {
             const v = neighbors[i];
@@ -576,7 +455,6 @@ async function runSimulatedAnnealing(ctx) {
             if (vColor === oldColor) oldNodeConflicts++;
             if (vColor === newColor) newNodeConflicts++;
         }
-
         const delta = newNodeConflicts - oldNodeConflicts;
 
         if (delta < 0 || Math.random() < Math.exp(-delta / T)) {
@@ -586,189 +464,165 @@ async function runSimulatedAnnealing(ctx) {
             if (currentConflicts < minConflicts) {
                 minConflicts = currentConflicts;
                 bestColoring.set(coloring);
-                sendStep(ctx, step, bestColoring); // Send BEST immediately
-                await delay(10);
+                sendStep(ctx, step, bestColoring, `SA Best: ${minConflicts} (Thres: ${getDynamicThreshold(minConflicts)})`);
+                await delay(5);
             }
         }
-
         T *= coolingRate;
-
-        // Heartbeat: Send BEST so far
-        if (step % 100 === 0) {
-            sendStep(ctx, step, bestColoring);
-            await delay(10);
-        }
         step++;
+        if (step % 200 === 0) { sendStep(ctx, step, bestColoring); await delay(0); }
     }
     coloring.set(bestColoring);
-    sendStep(ctx, step);
 }
 
 async function runGeneticAlgorithm(ctx) {
     const { nodeCount, adj, coloring, params } = ctx;
-    const maxColors = params.maxColors || 5;
+    const maxColors = params.maxColors;
     const popSize = params.population || 50;
-    const generations = params.generations || 100;
     const mutationRate = 0.05;
 
-    // Population: Array of Int32Arrays
     let population = [];
-    for (let i = 0; i < popSize; i++) {
-        population.push(randomColoringArray(nodeCount, maxColors));
-    }
+    for (let i = 0; i < popSize; i++) population.push(randomColoringArray(nodeCount, maxColors));
 
     const getFitness = (c) => -countConflicts(c, adj).count;
 
     let bestColoring = new Int32Array(population[0]);
-    let maxFitness = getFitness(bestColoring);
+    let maxFitness = getFitness(bestColoring); // Negative value
+    let lastCheckTime = performance.now();
+    let bestFitnessAtLastCheck = maxFitness;
+    let gen = 0;
 
-    for (let gen = 0; gen < generations; gen++) {
-        checkLimit(ctx);
+    coloring.set(bestColoring);
+    sendStep(ctx, 0, coloring, 'Initializing GA...');
+    await delay(50);
 
-        // Sort by fitness
+    while (maxFitness < 0) {
+        if (checkGlobalTime(ctx)) return;
+
+        // --- DYNAMIC STAGNATION CHECK ---
+        if (performance.now() - lastCheckTime > STAGNATION_TIME_MS) {
+            const currentConflicts = -maxFitness;
+            const prevConflicts = -bestFitnessAtLastCheck;
+            const threshold = getDynamicThreshold(prevConflicts);
+            const improvement = prevConflicts - currentConflicts;
+
+            if (improvement < threshold) {
+                sendStep(ctx, gen, bestColoring, `GA Stagnated (Imp: ${improvement} < Thres: ${threshold}). Retry...`);
+                return;
+            } else {
+                bestFitnessAtLastCheck = maxFitness;
+                lastCheckTime = performance.now();
+            }
+        }
+
         population.sort((a, b) => getFitness(b) - getFitness(a));
-
         const currentBest = population[0];
         const currentFitness = getFitness(currentBest);
 
         if (currentFitness > maxFitness) {
             maxFitness = currentFitness;
             bestColoring.set(currentBest);
-            sendStep(ctx, gen, bestColoring);
-            await delay(20);
-        } else if (gen % 10 === 0) {
-            sendStep(ctx, gen, bestColoring);
+            sendStep(ctx, gen, bestColoring, `GA Gen ${gen}: Best ${-maxFitness}`);
             await delay(10);
         }
 
-        if (currentFitness === 0) break;
-
-        // Elitism
         const newPop = [population[0], population[1]];
-
         while (newPop.length < popSize) {
-            // Tournament Selection
             const p1 = population[Math.floor(Math.random() * popSize)];
             const p2 = population[Math.floor(Math.random() * popSize)];
             const parent1 = getFitness(p1) > getFitness(p2) ? p1 : p2;
-            const parent2 = population[Math.floor(Math.random() * popSize)]; // Simple random second parent
-
-            // One-Point Crossover
+            const parent2 = population[Math.floor(Math.random() * popSize)];
             const child = new Int32Array(nodeCount);
             const crossoverPoint = Math.floor(Math.random() * nodeCount);
-            for (let i = 0; i < nodeCount; i++) {
-                child[i] = (i < crossoverPoint) ? parent1[i] : parent2[i];
-            }
-
-            // Mutation
+            for (let i = 0; i < nodeCount; i++) child[i] = (i < crossoverPoint) ? parent1[i] : parent2[i];
             if (Math.random() < mutationRate) {
                 const u = Math.floor(Math.random() * nodeCount);
                 child[u] = Math.floor(Math.random() * maxColors) + 1;
             }
-
             newPop.push(child);
         }
         population = newPop;
+        gen++;
+        if (gen % 20 === 0) { coloring.set(bestColoring); sendStep(ctx, gen, bestColoring); await delay(0); }
     }
     coloring.set(bestColoring);
-    sendStep(ctx, generations);
 }
 
 async function runTabuSearch(ctx) {
     const { nodeCount, adj, coloring, params } = ctx;
-    const maxColors = params.maxColors || 5;
-    const maxIter = params.maxSteps || 500;
-    const tabuTenure = 10; // Steps a move is tabu
+    const maxColors = params.maxColors;
+    const tabuTenure = 15;
 
-    // Initial
     coloring.set(randomColoringArray(nodeCount, maxColors));
+    sendStep(ctx, 0, coloring, 'Initializing Tabu...');
+    await delay(50);
+
     let bestColoring = new Int32Array(coloring);
     let bestConflicts = countConflicts(coloring, adj).count;
+    let bestConflictsAtLastCheck = bestConflicts;
 
-    // Tabu List: Map of "nodeIndex-color" -> stepCount
     const tabuList = new Map();
+    let step = 0;
+    let lastCheckTime = performance.now();
 
-    for (let step = 0; step < maxIter; step++) {
-        checkLimit(ctx);
-        if (bestConflicts === 0) break;
+    while (bestConflicts > 0) {
+        if (checkGlobalTime(ctx)) return;
 
-        const { count, conflicts } = countConflicts(coloring, adj);
-        // conflicts is array of [u, v] pairs
+        // --- DYNAMIC STAGNATION CHECK ---
+        if (performance.now() - lastCheckTime > STAGNATION_TIME_MS) {
+            const threshold = getDynamicThreshold(bestConflictsAtLastCheck);
+            const improvement = bestConflictsAtLastCheck - bestConflicts;
 
-        // Identify conflicting nodes
-        const conflictingNodes = new Set();
-        for (const [u, v] of conflicts) {
-            conflictingNodes.add(u);
-            conflictingNodes.add(v);
+            if (improvement < threshold) {
+                sendStep(ctx, step, bestColoring, `Tabu Stagnated (Imp: ${improvement} < Thres: ${threshold}). Retry...`);
+                return;
+            } else {
+                bestConflictsAtLastCheck = bestConflicts;
+                lastCheckTime = performance.now();
+            }
         }
 
-        // If no conflicts (should be caught by bestConflicts === 0), break
+        const { count, conflicts } = countConflicts(coloring, adj);
+        const conflictingNodes = new Set();
+        for (const [u, v] of conflicts) { conflictingNodes.add(u); conflictingNodes.add(v); }
         if (conflictingNodes.size === 0) break;
 
         let bestMove = null;
         let bestMoveDelta = Infinity;
 
-        // Neighborhood Search: Try changing color of conflicting nodes
-        // Iterate ALL conflicting nodes (Critical Neighbor Search)
         for (const u of conflictingNodes) {
             const oldColor = coloring[u];
-
-            // Try all other colors
             for (let c = 1; c <= maxColors; c++) {
                 if (c === oldColor) continue;
-
-                // Calculate delta
-                let oldNodeConflicts = 0;
-                let newNodeConflicts = 0;
+                let delta = 0;
                 const neighbors = adj[u];
                 for (let i = 0; i < neighbors.length; i++) {
                     const v = neighbors[i];
                     const vColor = coloring[v];
-                    if (vColor === oldColor) oldNodeConflicts++;
-                    if (vColor === c) newNodeConflicts++;
+                    if (vColor === oldColor) delta--;
+                    if (vColor === c) delta++;
                 }
-                const delta = newNodeConflicts - oldNodeConflicts;
-
-                // Tabu check
                 const moveKey = `${u}-${c}`;
                 const isTabu = tabuList.has(moveKey) && tabuList.get(moveKey) > step;
-
-                // Aspiration Criteria: Allow tabu move if it improves GLOBAL best
                 if (!isTabu || (count + delta < bestConflicts)) {
-                    if (delta < bestMoveDelta) {
-                        bestMoveDelta = delta;
-                        bestMove = { u, newColor: c, oldColor };
-                    }
+                    if (delta < bestMoveDelta) { bestMoveDelta = delta; bestMove = { u, newColor: c, oldColor }; }
                 }
             }
         }
 
         if (bestMove) {
             coloring[bestMove.u] = bestMove.newColor;
-
-            // Add reverse move to tabu list
             tabuList.set(`${bestMove.u}-${bestMove.oldColor}`, step + tabuTenure);
-
-            // Clean up old tabu entries occasionally to save memory (optional)
-
             const currentConflicts = count + bestMoveDelta;
             if (currentConflicts < bestConflicts) {
                 bestConflicts = currentConflicts;
                 bestColoring.set(coloring);
-                sendStep(ctx, step, bestColoring);
-                await delay(10);
+                sendStep(ctx, step, bestColoring, `Tabu Best: ${bestConflicts}`);
+                await delay(5);
             }
-        } else {
-            // Stuck? Random restart or perturbation could go here
-            // For now, just break or continue
-            break;
         }
-
-        if (step % 50 === 0) {
-            sendStep(ctx, step, bestColoring);
-            await delay(10);
-        }
+        step++;
+        if (step % 50 === 0) { sendStep(ctx, step, bestColoring); await delay(0); }
     }
     coloring.set(bestColoring);
-    sendStep(ctx, maxIter);
 }
