@@ -1,4 +1,4 @@
-import { setupContext, sendStep, finish, delay, checkGlobalTime, countConflicts, randomColoringArray, getDynamicThreshold, STAGNATION_TIME_MS } from './workerUtils';
+import { setupContext, sendStep, finish, delay, checkGlobalTime, countConflicts, randomColoringArray, getDynamicThreshold } from './workerUtils';
 
 self.onmessage = async (e) => {
     const ctx = setupContext(e.data.payload.graphData, e.data.payload.params);
@@ -15,6 +15,7 @@ self.onmessage = async (e) => {
         let bestColoring = new Int32Array(ctx.coloring);
         let minConflicts = currentConflicts;
         let bestConflictsAtLastCheck = minConflicts;
+        let stagnated = false;
 
         let T = ctx.params.temperature || 1000;
         const coolingRate = 1 - (1 / (T * 2));
@@ -22,18 +23,24 @@ self.onmessage = async (e) => {
         let lastCheckTime = performance.now();
         let step = 0;
 
-        self.postMessage({ type: 'STEP', payload: { step: 0, conflicts: [], metrics: { iter: 0, conflicts: minConflicts, time: performance.now() - ctx.globalStartTime, status: `SA k=${currentMaxColors}` } } });
+        sendStep(ctx, 0, ctx.coloring, `SA Init k=${currentMaxColors}`);
+        await delay(20);
 
-        // Inner Loop
         while (currentConflicts > 0 && T > minT) {
             if (checkGlobalTime(ctx)) { finish(ctx, 'Limit Reached'); return; }
 
-            // Stagnation Check
-            if (performance.now() - lastCheckTime > STAGNATION_TIME_MS) {
+            // --- STAGNATION CHECK ---
+            if (performance.now() - lastCheckTime > ctx.stagnationTime) {
                 const threshold = getDynamicThreshold(bestConflictsAtLastCheck);
-                if ((bestConflictsAtLastCheck - minConflicts) < threshold) break; // Thoát để tăng màu
-                bestConflictsAtLastCheck = minConflicts;
-                lastCheckTime = performance.now();
+                const improvement = bestConflictsAtLastCheck - minConflicts;
+
+                if (improvement < threshold) {
+                    stagnated = true;
+                    break; // Break để tăng màu
+                } else {
+                    bestConflictsAtLastCheck = minConflicts;
+                    lastCheckTime = performance.now();
+                }
             }
 
             const u = Math.floor(Math.random() * ctx.nodeCount);
@@ -63,11 +70,17 @@ self.onmessage = async (e) => {
             if (step % 200 === 0) { sendStep(ctx, step, bestColoring); await delay(0); }
         }
 
-        if (minConflicts === 0) {
+        if (!stagnated && minConflicts === 0) {
             ctx.coloring.set(bestColoring);
             solved = true;
         } else {
-            currentMaxColors++;
+            // --- DYNAMIC COLOR JUMP ---
+            if (minConflicts > 100) {
+                currentMaxColors += 2;
+                sendStep(ctx, step, bestColoring, `Conflict High (${minConflicts}). Jumping to k=${currentMaxColors}...`);
+            } else {
+                currentMaxColors++;
+            }
         }
     }
     finish(ctx, 'Completed');

@@ -1,12 +1,10 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
-import GraphCanvas from './components/GraphCanvas'
-import Controls from './components/Controls'
-import BenchmarkResults from './components/BenchmarkResults'
-import LiveMetrics from './components/LiveMetrics'
-import { Graph } from './core/Graph'
+import { useState, useEffect, useCallback, useRef } from 'react';
+import GraphCanvas from './components/GraphCanvas';
+import Controls from './components/Controls';
+import BenchmarkResults from './components/BenchmarkResults';
+import LiveMetrics from './components/LiveMetrics';
+import { Graph } from './core/Graph';
 
-// Map tên thuật toán sang file worker tương ứng
-// Đảm bảo ông đã tạo đủ các file này trong thư mục src/workers/
 const ALGO_WORKERS = {
     basicGreedy: new URL('./workers/basicGreedyWorker.js', import.meta.url),
     welshPowell: new URL('./workers/welshPowellWorker.js', import.meta.url),
@@ -21,13 +19,14 @@ const ALGO_WORKERS = {
 };
 
 function App() {
-    const [mode, setMode] = useState('visualizer'); // 'visualizer' | 'benchmark'
+    const [mode, setMode] = useState('visualizer');
     const [params, setParams] = useState({
         nodeCount: 50,
         density: 0.5,
         algorithm: 'welshPowell',
         maxColors: 5,
-        timeLimit: 10, // Seconds
+        timeLimit: 10,
+        stagnationTime: 1000,
         population: 50,
         generations: 100,
         temperature: 1000,
@@ -36,57 +35,64 @@ function App() {
     });
 
     const [isPlaying, setIsPlaying] = useState(false);
-
-    // Graph State
     const [graphData, setGraphData] = useState({ nodes: [], links: [] });
     const [coloringStatus, setColoringStatus] = useState({});
     const [conflictingEdges, setConflictingEdges] = useState([]);
     const [metrics, setMetrics] = useState([]);
+    const [benchmarkResults, setBenchmarkResults] = useState([]);
     const [splitRatio, setSplitRatio] = useState(0.5);
+
+    const workerRef = useRef(null);
     const isResizingRef = useRef(false);
 
     const usedColorsCount = new Set(Object.values(coloringStatus)).size;
 
-    // Generate graph
+    // Generate initial graph
     useEffect(() => {
         if (!isPlaying) {
-            const newGraph = Graph.generateRandom(params.nodeCount, params.density);
-            setGraphData(newGraph);
-            setColoringStatus({});
-            setConflictingEdges([]);
-            setMetrics([]);
+            resetGraph();
         }
     }, [params.nodeCount, params.density]);
+
+    const resetGraph = () => {
+        const newGraph = Graph.generateRandom(params.nodeCount, params.density);
+        setGraphData(newGraph);
+        setColoringStatus({});
+        setConflictingEdges([]);
+        setMetrics([]);
+    };
 
     const handleParamChange = (key, value) => {
         setParams(prev => ({ ...prev, [key]: value }));
     };
 
-    const workerRef = useRef(null);
-
-    // Hàm tạo worker mới
     const createWorker = (algoName) => {
         if (workerRef.current) workerRef.current.terminate();
 
         const workerUrl = ALGO_WORKERS[algoName];
         if (!workerUrl) {
             console.error("Worker not found for:", algoName);
-            // Fallback nếu chưa tạo file worker thì dùng basicGreedy tạm để không crash
-            return new Worker(ALGO_WORKERS['basicGreedy'], { type: 'module' });
+            return null;
         }
 
         const worker = new Worker(workerUrl, { type: 'module' });
 
         worker.onmessage = (e) => {
             const { type, payload } = e.data;
-            if (type === 'DONE') {
-                setIsPlaying(false);
-                console.log('Algorithm finished:', payload);
-            } else if (type === 'STEP') {
+
+            if (type === 'STEP') {
                 if (payload.coloring) setColoringStatus(payload.coloring);
                 if (payload.conflicts) setConflictingEdges(payload.conflicts);
                 if (payload.metrics) setMetrics(prev => [...prev, payload.metrics]);
-            } else if (type === 'ERROR') {
+            }
+            else if (type === 'DONE') {
+                setIsPlaying(false);
+                // Cập nhật trạng thái lần cuối để đảm bảo không bị mất màu (force fill)
+                if (payload.coloring) setColoringStatus(payload.coloring);
+                if (payload.conflicts) setConflictingEdges(payload.conflicts);
+                console.log('Algorithm finished:', payload);
+            }
+            else if (type === 'ERROR') {
                 console.error("Worker Error:", payload.message);
                 setIsPlaying(false);
             }
@@ -96,7 +102,6 @@ function App() {
         return worker;
     };
 
-    // Handle Run Visualizer
     const runVisualizer = () => {
         const worker = createWorker(params.algorithm);
         if (!worker) return;
@@ -107,24 +112,30 @@ function App() {
         });
     };
 
-    // Handle Run Benchmark
-    const [benchmarkResults, setBenchmarkResults] = useState([]);
-
     const runBenchmark = async () => {
         setBenchmarkResults([]);
 
         for (const algoName of params.selectedAlgorithms) {
             await new Promise((resolve) => {
-                // Tạo worker riêng cho từng thuật toán trong loop
                 const workerUrl = ALGO_WORKERS[algoName];
                 if (!workerUrl) { resolve(); return; }
 
                 const worker = new Worker(workerUrl, { type: 'module' });
-                workerRef.current = worker; // Để nút Reset có thể kill được
+                workerRef.current = worker; // Gán để nút Reset có thể kill
 
                 worker.onmessage = (e) => {
                     const { type, payload } = e.data;
+
+                    // Visualize live ngay cả trong Benchmark
+                    if (type === 'STEP') {
+                        if (payload.coloring) setColoringStatus(payload.coloring);
+                        if (payload.conflicts) setConflictingEdges(payload.conflicts);
+                    }
+
                     if (type === 'DONE') {
+                        // Cập nhật frame cuối
+                        if (payload.coloring) setColoringStatus(payload.coloring);
+
                         setBenchmarkResults(prev => [...prev, {
                             name: algoName,
                             time: payload.metrics?.time || 0,
@@ -141,7 +152,7 @@ function App() {
                     payload: { name: algoName, params, graphData }
                 });
             });
-            // Nghỉ 200ms giữa các bài test
+            // Nghỉ ngắn giữa các thuật toán
             await new Promise(r => setTimeout(r, 200));
         }
         setIsPlaying(false);
@@ -160,19 +171,13 @@ function App() {
     };
 
     const handleReset = () => {
-        console.log('Resetting graph and killing worker');
         setIsPlaying(false);
         if (workerRef.current) workerRef.current.terminate();
-
-        const newGraph = Graph.generateRandom(params.nodeCount, params.density);
-        setGraphData(newGraph);
-        setColoringStatus({});
-        setConflictingEdges([]);
-        setMetrics([]);
+        resetGraph();
     };
 
     // Resize Logic
-    const handleMouseDown = (e) => {
+    const handleMouseDown = () => {
         isResizingRef.current = true;
         document.addEventListener('mousemove', handleMouseMove);
         document.addEventListener('mouseup', handleMouseUp);
@@ -180,8 +185,7 @@ function App() {
 
     const handleMouseMove = useCallback((e) => {
         if (!isResizingRef.current) return;
-        const containerHeight = window.innerHeight;
-        const newRatio = (e.clientY / containerHeight);
+        const newRatio = e.clientY / window.innerHeight;
         if (newRatio > 0.1 && newRatio < 0.9) setSplitRatio(newRatio);
     }, []);
 
@@ -200,6 +204,7 @@ function App() {
 
     return (
         <div className="flex h-screen w-screen overflow-hidden">
+            {/* Sidebar */}
             <div className="w-80 flex-shrink-0 bg-slate-800 border-r border-slate-700 p-4 overflow-y-auto">
                 <h1 className="text-xl font-bold text-white mb-6">Graph Coloring</h1>
                 <Controls
@@ -220,20 +225,16 @@ function App() {
                                 <div className="text-xs text-slate-300">
                                     Score: <span className="font-bold text-blue-400">
                                         {(() => {
-                                            const lastMetric = metrics[metrics.length - 1];
-                                            if (!lastMetric) return 100;
-                                            const timeInSeconds = lastMetric.time / 1000;
-                                            const iterPenalty = lastMetric.iter / 50;
-                                            let score = 100 - (timeInSeconds + iterPenalty);
-                                            if (score < 0) score = 0;
-                                            return score.toFixed(2);
+                                            const last = metrics[metrics.length - 1];
+                                            if (!last) return 100;
+                                            const score = 100 - ((last.time / 1000) + (last.iter / 50));
+                                            return Math.max(0, score).toFixed(2);
                                         })()}
                                     </span>
                                 </div>
                             )}
                         </div>
                         <LiveMetrics data={metrics} />
-
                         <div className="mt-2 p-2 bg-slate-900 border border-slate-700 rounded flex items-center justify-between">
                             <span className="text-xs font-medium text-slate-400">Colors Used:</span>
                             <span className="text-sm font-bold text-emerald-400">{usedColorsCount}</span>
@@ -242,6 +243,7 @@ function App() {
                 )}
             </div>
 
+            {/* Main Content */}
             <div className="flex-grow relative bg-slate-900 flex flex-col">
                 {mode === 'visualizer' ? (
                     <GraphCanvas
@@ -275,7 +277,7 @@ function App() {
                 )}
             </div>
         </div>
-    )
+    );
 }
 
-export default App
+export default App;

@@ -1,4 +1,4 @@
-import { setupContext, sendStep, finish, delay, checkGlobalTime, countConflicts, randomColoringArray, getDynamicThreshold, STAGNATION_TIME_MS } from './workerUtils';
+import { setupContext, sendStep, finish, delay, checkGlobalTime, countConflicts, randomColoringArray, getDynamicThreshold } from './workerUtils';
 
 self.onmessage = async (e) => {
     const ctx = setupContext(e.data.payload.graphData, e.data.payload.params);
@@ -19,17 +19,27 @@ self.onmessage = async (e) => {
         let lastCheckTime = performance.now();
         let bestConflictsAtLastCheck = minConflicts;
         let gen = 0;
+        let stagnated = false;
 
-        self.postMessage({ type: 'STEP', payload: { step: 0, conflicts: [], metrics: { iter: 0, conflicts: minConflicts, time: performance.now() - ctx.globalStartTime, status: `GA k=${currentMaxColors}` } } });
+        ctx.coloring.set(bestColoring);
+        sendStep(ctx, 0, ctx.coloring, `GA Init k=${currentMaxColors}`);
+        await delay(20);
 
         while (minConflicts > 0) {
             if (checkGlobalTime(ctx)) { finish(ctx, 'Limit Reached'); return; }
 
-            if (performance.now() - lastCheckTime > STAGNATION_TIME_MS) {
+            // --- STAGNATION CHECK ---
+            if (performance.now() - lastCheckTime > ctx.stagnationTime) {
                 const threshold = getDynamicThreshold(bestConflictsAtLastCheck);
-                if ((bestConflictsAtLastCheck - minConflicts) < threshold) break; // Stagnated
-                bestConflictsAtLastCheck = minConflicts;
-                lastCheckTime = performance.now();
+                const improvement = bestConflictsAtLastCheck - minConflicts;
+
+                if (improvement < threshold) {
+                    stagnated = true;
+                    break; // Break để ra ngoài tăng màu
+                } else {
+                    bestConflictsAtLastCheck = minConflicts;
+                    lastCheckTime = performance.now();
+                }
             }
 
             population.sort((a, b) => getConflictCount(a) - getConflictCount(b));
@@ -40,7 +50,7 @@ self.onmessage = async (e) => {
                 minConflicts = currentConflicts;
                 bestColoring.set(currentBest);
                 sendStep(ctx, gen, bestColoring, `GA Best: ${minConflicts}`);
-                await delay(10);
+                await delay(5);
             }
 
             const newPop = [population[0], population[1]];
@@ -62,14 +72,26 @@ self.onmessage = async (e) => {
             }
             population = newPop;
             gen++;
-            if (gen % 20 === 0) { ctx.coloring.set(bestColoring); sendStep(ctx, gen, bestColoring); await delay(0); }
+
+            if (gen % 20 === 0) {
+                ctx.coloring.set(bestColoring);
+                sendStep(ctx, gen, bestColoring, `GA Gen ${gen} (k=${currentMaxColors})`);
+                await delay(0);
+            }
         }
 
-        if (minConflicts === 0) {
+        if (!stagnated && minConflicts === 0) {
             ctx.coloring.set(bestColoring);
             solved = true;
         } else {
-            currentMaxColors++;
+            // --- DYNAMIC COLOR JUMP ---
+            // Nếu đang sai quá nhiều (>100) -> Tăng 2 màu để nhảy cóc
+            if (minConflicts > 100) {
+                currentMaxColors += 2;
+                sendStep(ctx, gen, bestColoring, `Conflict High (${minConflicts}). Jumping to k=${currentMaxColors}...`);
+            } else {
+                currentMaxColors++;
+            }
         }
     }
     finish(ctx, 'Completed');

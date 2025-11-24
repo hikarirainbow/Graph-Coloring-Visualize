@@ -1,6 +1,9 @@
 import React from 'react';
 
 const Controls = ({ mode, setMode, params, onParamChange, onRun, onReset, isPlaying }) => {
+    const showMetaSettings = ['geneticAlgorithm', 'simulatedAnnealing', 'tabuSearch'].includes(params.algorithm) ||
+        (mode === 'benchmark' && params.selectedAlgorithms.some(a => ['geneticAlgorithm', 'simulatedAnnealing', 'tabuSearch'].includes(a)));
+
     const showGASettings = params.algorithm === 'geneticAlgorithm' ||
         (mode === 'benchmark' && params.selectedAlgorithms.includes('geneticAlgorithm'));
 
@@ -130,9 +133,26 @@ const Controls = ({ mode, setMode, params, onParamChange, onRun, onReset, isPlay
                     />
                 </div>
 
-                {(showGASettings || showSASettings) && (
+                {showMetaSettings && (
                     <div className="pt-4 border-t border-slate-700 space-y-4">
                         <h3 className="text-xs font-bold text-slate-300 uppercase">Advanced Settings</h3>
+
+                        {/* STAGNATION TIME SLIDER */}
+                        <div>
+                            <div className="flex justify-between mb-1">
+                                <label className="text-xs font-semibold text-slate-400">Stagnation Time (ms)</label>
+                                <span className="text-xs text-slate-200">{params.stagnationTime}ms</span>
+                            </div>
+                            <input
+                                type="range"
+                                min="1000"
+                                max="20000"
+                                step="1000"
+                                value={params.stagnationTime}
+                                onChange={(e) => onParamChange('stagnationTime', parseInt(e.target.value))}
+                                className="w-full h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer"
+                            />
+                        </div>
 
                         {showGASettings && (
                             <div>
@@ -167,7 +187,6 @@ const Controls = ({ mode, setMode, params, onParamChange, onRun, onReset, isPlay
                                     onChange={(e) => onParamChange('temperature', parseInt(e.target.value))}
                                     className="w-full h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer"
                                 />
-                                <p className="text-[10px] text-slate-500 mt-1">Lower = Fast Cooling. Higher = Deep Search.</p>
                             </div>
                         )}
                     </div>

@@ -1,7 +1,5 @@
-// Các hàm tiện ích dùng chung cho tất cả Worker
-
 export const DELAY_MS = 15;
-export const STAGNATION_TIME_MS = 5000;
+export const DEFAULT_STAGNATION_MS = 1000;
 
 export function setupContext(graphData, params) {
     const nodeCount = graphData.nodes.length;
@@ -37,6 +35,13 @@ export function setupContext(graphData, params) {
         globalStartTime: performance.now(),
         timeLimit: (params.timeLimit || 10) * 1000,
     };
+}
+
+export function isFullyColored(coloring) {
+    for (let i = 0; i < coloring.length; i++) {
+        if (coloring[i] === 0) return false;
+    }
+    return true;
 }
 
 export function countConflicts(coloring, adj) {
@@ -85,18 +90,53 @@ export function sendStep(ctx, step, overrideColoring = null, status = null) {
 }
 
 export function finish(ctx, result) {
-    let maxC = 0;
-    for (let i = 0; i < ctx.nodeCount; i++) if (ctx.coloring[i] > maxC) maxC = ctx.coloring[i];
+    // 1. Greedy Fill: Tô nốt các ô màu 0 bằng màu tốt nhất có thể
+    // Để tránh việc trả về màn hình trắng xóa
+    let currentMax = 0;
+    for (let i = 0; i < ctx.nodeCount; i++) if (ctx.coloring[i] > currentMax) currentMax = ctx.coloring[i];
+    if (currentMax === 0) currentMax = 1; // Fallback
 
+    for (let u = 0; u < ctx.nodeCount; u++) {
+        if (ctx.coloring[u] === 0) {
+            // Tìm màu ít xung đột nhất trong khoảng 1..currentMax+1
+            let bestColor = 1;
+            let minConf = Infinity;
+
+            // Thử các màu đã dùng + thêm 1 màu mới (để mở rộng nếu bí)
+            for (let c = 1; c <= currentMax + 1; c++) {
+                let conf = 0;
+                for (const v of ctx.adj[u]) {
+                    if (ctx.coloring[v] === c) conf++;
+                }
+                if (conf < minConf) {
+                    minConf = conf;
+                    bestColor = c;
+                }
+                if (conf === 0) break; // Màu này ngon, chọn luôn
+            }
+            ctx.coloring[u] = bestColor;
+            if (bestColor > currentMax) currentMax = bestColor;
+        }
+    }
+
+    // 2. Tính toán lại Conflict thực tế sau khi Fill
+    const { count, conflicts } = countConflicts(ctx.coloring, ctx.adj);
+
+    // 3. Gửi kết quả kèm Conflict List để UI vẽ line đỏ
     self.postMessage({
         type: 'DONE',
         payload: {
             result: result,
             metrics: {
                 time: performance.now() - ctx.globalStartTime,
-                colors: maxC
+                colors: currentMax,
+                conflicts: count // Thêm metric này
             },
             coloring: mapColoring(ctx),
+            conflicts: conflicts.map(([u, v]) => ({
+                source: ctx.revNodeMap[u],
+                target: ctx.revNodeMap[v]
+            }))
         }
     });
 }
@@ -138,6 +178,7 @@ export function getLeastConflictingColor(u, adj, coloring, maxColors) {
 
 export function getDynamicThreshold(currentConflicts) {
     if (currentConflicts > 100) return 5;
+    if (currentConflicts > 80) return 4;
     if (currentConflicts > 50) return 3;
     if (currentConflicts > 20) return 2;
     return 1;

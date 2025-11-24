@@ -20,3 +20,5 @@ self.onmessage = async (e) => {
     }
     finish(ctx, 'Completed');
 };
+
+
