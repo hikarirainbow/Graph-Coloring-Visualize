@@ -3,7 +3,8 @@ import GraphCanvas from './components/GraphCanvas'
 import Controls from './components/Controls'
 import BenchmarkResults from './components/BenchmarkResults'
 import LiveMetrics from './components/LiveMetrics'
-import * as Graph from './core/Graph'
+// FIX: Import { Graph } thay vì * as Graph để tránh lỗi undefined
+import { Graph } from './core/Graph'
 
 function App() {
     const [mode, setMode] = useState('visualizer'); // 'visualizer' | 'benchmark'
@@ -29,6 +30,9 @@ function App() {
     const [metrics, setMetrics] = useState([]); // Array of { iter, conflicts }
     const [splitRatio, setSplitRatio] = useState(0.5); // Ratio for benchmark split view
     const isResizingRef = useRef(false);
+
+    // Tính toán số lượng màu đang sử dụng thực tế
+    const usedColorsCount = new Set(Object.values(coloringStatus)).size;
 
     // Generate graph when params change (only if not playing)
     useEffect(() => {
@@ -237,6 +241,14 @@ function App() {
                             )}
                         </div>
                         <LiveMetrics data={metrics} />
+
+                        {/* --- NEW FEATURE: Colors Used Display --- */}
+                        <div className="mt-2 p-2 bg-slate-900 border border-slate-700 rounded flex items-center justify-between">
+                            <span className="text-xs font-medium text-slate-400">Colors Used:</span>
+                            <span className="text-sm font-bold text-emerald-400">{usedColorsCount}</span>
+                        </div>
+                        {/* ---------------------------------------- */}
+
                     </div>
                 )}
             </div>
